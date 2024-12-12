@@ -239,18 +239,65 @@ class YOLO_SEG_RKNN(object):
 
         return boxes, classes, scores, seg_img
 
-    def merge_seg(self, image, seg_img, classes):
+    def get_true_mask(self, seg_mask, img_shape, pad_info):
+        """Get mask for original image considering padding and scaling.
+        
+        Args:
+            seg_mask: Original segmentation mask
+            img_shape: Original image shape (h, w)
+            pad_info: Padding information (ratio, (dw, dh))
+        Returns:
+            Mask aligned with original image
+        """
+        ratio, (dw, dh) = pad_info
+        ori_h, ori_w = img_shape
+        
+        # 计算letterbox后的实际图像尺寸（不包含padding）
+        unpad_h = int(round(ori_h * ratio))
+        unpad_w = int(round(ori_w * ratio))
+        
+        # 从640x640的mask中裁剪出实际图像区域（去除padding）
+        mask_h, mask_w = seg_mask.shape
+        dh = int(dh)
+        dw = int(dw)
+        seg_mask = seg_mask[dh:mask_h-dh, dw:mask_w-dw]
+        
+        # 缩放到原始图像大小
+        seg_mask = cv2.resize(seg_mask.astype(np.uint8), (ori_w, ori_h), 
+                             interpolation=cv2.INTER_NEAREST)
+        
+        return seg_mask
+
+    def merge_seg(self, image, seg_img, classes, pad_info):
         """Merge segmentation masks with the original image."""
-        h, w = image.shape[:2]  # Get original image dimensions
+        h, w = image.shape[:2]
         for i in range(len(seg_img)):
-            seg = seg_img[i]
-            # Resize segmentation mask to match original image size
-            seg = cv2.resize(seg.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+            # Get properly aligned mask for original image
+            seg = self.get_true_mask(seg_img[i], (h, w), pad_info)
             seg = cv2.cvtColor(seg, cv2.COLOR_GRAY2BGR)
             seg = seg * self.color(classes[i])
             seg = seg.astype(np.uint8)
             image = cv2.add(image, seg)
         return image
+
+    def inference(self, frame):
+        """Inference function."""
+        orig_h, orig_w = frame.shape[:2]
+        
+        # Preprocess
+        img, ratio, (dw, dh) = self.letter_box(frame, self.IMG_SIZE)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Inference
+        outputs = self.rknn.inference(inputs=[img])
+        
+        # Post process
+        boxes, classes, scores, seg_img = self.post_process(outputs)
+        
+        # Pack padding info
+        pad_info = (ratio, (dw, dh))
+        
+        return boxes, classes, scores, seg_img, pad_info
 
     def draw(self, image, boxes, scores, classes):
         """Draw detection results."""
@@ -262,22 +309,69 @@ class YOLO_SEG_RKNN(object):
                         (top, left - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         return image
 
-    def inference(self, frame):
-        """Inference function."""
-        orig_h, orig_w = frame.shape[:2]
-        # Preprocess
-        img, ratio, (dw, dh) = self.letter_box(frame, self.IMG_SIZE)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        # Inference
-        outputs = self.rknn.inference(inputs=[img])
-        
-        # Post process
-        boxes, classes, scores, seg_img = self.post_process(outputs)
-        
-        return boxes, classes, scores, seg_img, ratio, (dw, dh), (orig_h, orig_w)
-
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model_path', type=str, default='../model/yolov8_seg.rknn', help='model path')
+    parser.add_argument('--target', type=str, default='rk3588', help='target platform')
+    parser.add_argument('--camera_id', type=int, default=21, help='camera device id')
+    args = parser.parse_args()
+
+    # Initialize model
+    detector = YOLO_SEG_RKNN(args.model_path, args.target)
+    
+    # Open camera
+    cap = cv2.VideoCapture(args.camera_id)
+    if not cap.isOpened():
+        print("Cannot open camera")
+        exit()
+    
+    print("Press 'q' to quit")
+    
+    # Initialize FPS calculation
+    fps = 0
+    prev_time = time.time()
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab frame")
+            break
+            
+        # Calculate FPS
+        current_time = time.time()
+        fps = 1 / (current_time - prev_time)
+        prev_time = current_time
+        
+        # Perform detection and segmentation
+        boxes, classes, scores, seg_img, pad_info = detector.inference(frame)
+        
+        # Draw results
+        if boxes is not None:
+            ratio, (dw, dh) = pad_info
+            # Transform boxes to original image coordinates
+            boxes[:, [0, 2]] = (boxes[:, [0, 2]] - dw) / ratio
+            boxes[:, [1, 3]] = (boxes[:, [1, 3]] - dh) / ratio
+            
+            # Draw boxes
+            frame = detector.draw(frame, boxes, scores, classes)
+            
+            # Draw segmentation with proper alignment
+            frame = detector.merge_seg(frame, seg_img, classes, pad_info)
+        
+        # Display FPS
+        cv2.putText(frame, f'FPS: {fps:.1f}', (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
+        # Show frame
+        cv2.imshow('YOLOv8 Detection & Segmentation', frame)
+        
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    
+    # Cleanup
+    cap.release()
+    cv2.destroyAllWindows()
+    detector.rknn.release()
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path', type=str, default='../model/yolov8_seg.rknn', help='model path')
     parser.add_argument('--target', type=str, default='rk3588', help='target platform')
